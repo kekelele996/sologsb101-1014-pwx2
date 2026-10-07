@@ -18,6 +18,7 @@ import {
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 import { usePlotStore } from './plotStore';
+import { replantGate } from '../utils/parcelLinkage';
 
 /** 补植计划筛选条件 */
 export interface ReplantFilters {
@@ -104,6 +105,15 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   },
 
   async createReplant(draft) {
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((row) => row.id === draft.plotId);
+    if (plot) {
+      // 挂起复核 / 只读期间不出补植计划
+      const gate = replantGate(plot, plotState.adjustments, plotState.surveys, plotState.plantings);
+      if (!gate.allowed) {
+        throw new Error(gate.reason || '当前不允许生成补植计划');
+      }
+    }
     const stamp = nowIso();
     const row: Replant = {
       id: uuid('replant'),

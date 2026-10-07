@@ -11,6 +11,8 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
+import type { Parcel } from '../types/parcel';
+import type { ParcelAdjustment } from '../types/parcelAdjustment';
 import { rateLevel } from './rate';
 import { nowIso, today } from './id';
 import { seedDatabase } from './seed';
@@ -19,10 +21,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
@@ -30,6 +32,10 @@ class MangroveDatabase extends Dexie {
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
+  /** 林业站权属台账：宗地编号 / 权属面积 / 四至 */
+  parcels!: Table<Parcel, string>;
+  /** 宗地重划（并宗 / 分宗）接账记录 */
+  parcelAdjustments!: Table<ParcelAdjustment, string>;
 
   constructor() {
     super(DB_NAME);
@@ -81,6 +87,82 @@ class MangroveDatabase extends Dexie {
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
         });
       });
+
+    // ---------- v3：接入林业站权属台账（宗地 + 并宗/分宗重划） ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots:
+          'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt, parcelCode, lineageRole',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+        // 宗地：parcelCode 唯一、按权属状态与编号检索
+        parcels: 'id, parcelCode, status, source, areaMu',
+        // 重划记录：按方式 / 挂账状态 / 生效日检索
+        parcelAdjustments: 'id, mode, linkState, effectiveDate, [mode+linkState]',
+      })
+      .upgrade(async (tx) => {
+        const stamp = nowIso();
+
+        // 迁移 1：既有修复地块补齐宗地对接字段。
+        // 老地块此前没有任何宗地归属，按「原地块编号回填历史宗地」（见下），
+        // 因此这里全部置为常规角色、非只读；回填不出的个别地块才置只读保留。
+        const plotRows = await tx.table('plots').toArray() as Array<Record<string, unknown>>;
+        const backfillCodes = new Set<string>();
+        for (const row of plotRows) {
+          if (typeof row.lineageRole !== 'string') row.lineageRole = 'normal';
+          if (typeof row.readOnly !== 'boolean') row.readOnly = false;
+          if (typeof row.parcelCode !== 'string') {
+            // 原地块编号即作为历史宗地编号回填；空 id 无法回填，留空并置只读
+            const legacyCode = typeof row.id === 'string' && row.id.trim() !== '' ? row.id : '';
+            row.parcelCode = legacyCode;
+            if (legacyCode === '') {
+              row.readOnly = true;
+            } else {
+              backfillCodes.add(legacyCode);
+            }
+          } else if ((row.parcelCode as string) !== '') {
+            backfillCodes.add(row.parcelCode as string);
+          }
+          row.revision = ROW_REVISION;
+          row.updatedAt = stamp;
+          await tx.table('plots').put(row);
+        }
+
+        // 迁移 2：为每个回填宗地编号补一条「历史宗地」权属台账。
+        // 权属面积直接采用对应老地块面积（当时唯一可得的面积口径）；
+        // 四至无历史记录可考，留空待林业站补登。回填不出的不造宗地（地块只读保留）。
+        const existingParcelCodes = new Set(
+          ((await tx.table('parcels').toArray()) as Array<Record<string, unknown>>)
+            .map((row) => row.parcelCode)
+            .filter((code): code is string => typeof code === 'string'),
+        );
+        const legacyParcels: Record<string, unknown>[] = [];
+        for (const code of backfillCodes) {
+          if (existingParcelCodes.has(code)) continue;
+          const plot = plotRows.find((row) => row.parcelCode === code);
+          legacyParcels.push({
+            id: `parcel-legacy-${code}`,
+            parcelCode: code,
+            areaMu: typeof plot?.areaMu === 'number' ? plot.areaMu : 0,
+            boundaries: { east: '', south: '', west: '', north: '' },
+            status: 'active',
+            source: 'legacyBackfill',
+            createdAt: stamp,
+            updatedAt: stamp,
+            revision: ROW_REVISION,
+          });
+        }
+        if (legacyParcels.length > 0) await tx.table('parcels').bulkPut(legacyParcels);
+
+        // 其余既有行统一抬到新行修订号
+        for (const tableName of ['seedlings', 'plantings', 'surveys', 'replants'] as const) {
+          await tx.table(tableName).toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
+        }
+      });
   }
 }
 
@@ -126,7 +208,8 @@ export async function patchPlot(id: string, patch: Partial<Plot>): Promise<void>
   await db.plots.update(id, { ...patch, updatedAt: nowIso() });
 }
 
-/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划 */
+/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划。
+ * 注意：不删除林业站宗地与重划记录——它们是权属台账，独立于项目部地块存续。 */
 export async function removePlot(id: string): Promise<void> {
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
     await db.seedlings.where('plotId').equals(id).delete();
@@ -135,6 +218,40 @@ export async function removePlot(id: string): Promise<void> {
     await db.replants.where('plotId').equals(id).delete();
     await db.plots.delete(id);
   });
+}
+
+/* -------------------------------- 宗地 -------------------------------- */
+
+export async function listParcels(): Promise<Parcel[]> {
+  const rows = await db.parcels.toArray();
+  return rows.sort((a, b) => a.parcelCode.localeCompare(b.parcelCode, 'zh-Hans-CN'));
+}
+
+export async function getParcelByCode(parcelCode: string): Promise<Parcel | undefined> {
+  return db.parcels.where('parcelCode').equals(parcelCode).first();
+}
+
+export async function putParcel(row: Parcel): Promise<void> {
+  await db.parcels.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeParcel(id: string): Promise<void> {
+  await db.parcels.delete(id);
+}
+
+/* ------------------------------ 宗地重划 ------------------------------ */
+
+export async function listParcelAdjustments(): Promise<ParcelAdjustment[]> {
+  const rows = await db.parcelAdjustments.toArray();
+  return rows.sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
+}
+
+export async function putParcelAdjustment(row: ParcelAdjustment): Promise<void> {
+  await db.parcelAdjustments.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeParcelAdjustment(id: string): Promise<void> {
+  await db.parcelAdjustments.delete(id);
 }
 
 /* ------------------------------ 苗木批次 ------------------------------ */
@@ -287,16 +404,20 @@ export interface DatabaseSnapshot {
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
+  parcels: Parcel[];
+  parcelAdjustments: ParcelAdjustment[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, parcels, parcelAdjustments] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
+    db.parcels.toArray(),
+    db.parcelAdjustments.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -307,11 +428,16 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     plantings,
     surveys,
     replants,
+    parcels,
+    parcelAdjustments,
   };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）。兼容缺少 v3 两表的旧档：缺失时按空集处理 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  const parcels = snapshot.parcels ?? [];
+  const parcelAdjustments = snapshot.parcelAdjustments ?? [];
+  // Dexie 单事务类型最多 7 张表，这里拆为「业务五表」与「权属两表」两个连续事务
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
     await Promise.all([
       db.plots.clear(),
@@ -326,6 +452,11 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
   });
+  await db.transaction('rw', db.parcels, db.parcelAdjustments, async () => {
+    await Promise.all([db.parcels.clear(), db.parcelAdjustments.clear()]);
+    await db.parcels.bulkPut(parcels.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.parcelAdjustments.bulkPut(parcelAdjustments.map((row) => ({ ...row, revision: ROW_REVISION })));
+  });
 }
 
 /** 清空全部数据并重新灌入演示数据 */
@@ -339,17 +470,22 @@ export async function resetDatabase(): Promise<void> {
       db.replants.clear(),
     ]);
   });
+  await db.transaction('rw', db.parcels, db.parcelAdjustments, async () => {
+    await Promise.all([db.parcels.clear(), db.parcelAdjustments.clear()]);
+  });
   await seedDatabase();
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, parcels, parcelAdjustments] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
+    db.parcels.count(),
+    db.parcelAdjustments.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, plantings, surveys, replants, parcels, parcelAdjustments };
 }

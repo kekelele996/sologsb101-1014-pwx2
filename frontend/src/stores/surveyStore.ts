@@ -11,6 +11,7 @@ import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
 import type { SurveyDraft } from '../types/survey';
 import { usePlotStore } from './plotStore';
+import { replantGate } from '../utils/parcelLinkage';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
 export interface SurveyFilters {
@@ -84,6 +85,13 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async createSurvey(draft) {
+    const targetPlot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (targetPlot?.readOnly) {
+      return Promise.reject(new Error('该地块为只读（宗地待确认或历史老地块），不能录入验收测次。'));
+    }
+    if (targetPlot?.lineageRole === 'mergeTarget') {
+      return Promise.reject(new Error('并宗地块不直接录入测次：请在其老地块历史验收中核对，并宗成活率按株数自动聚合。'));
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     const stamp = nowIso();
@@ -109,6 +117,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async updateSurvey(surveyId, draft) {
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
+    const targetPlot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (targetPlot?.readOnly) {
+      throw new Error('该地块为只读（宗地待确认或历史老地块），历史验收记录不能修改。');
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     await putSurvey({
@@ -138,9 +150,15 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async generateReplant(plotId) {
-    const summary = get().summaryOf(plotId);
-    const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
+
+    // 补植闸门：只读 / 宗地重划挂起复核期间，一律不出补植计划
+    const gate = replantGate(plot, plotState.adjustments, plotState.surveys, plotState.plantings);
+    if (!gate.allowed) return gate.reason || '当前不允许生成补植计划';
+
+    const summary = get().summaryOf(plotId);
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';

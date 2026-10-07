@@ -8,6 +8,7 @@ import { Skeleton } from 'antd';
 import App from '../App';
 
 const PlotList = lazy(() => import('../pages/PlotList'));
+const ParcelLedger = lazy(() => import('../pages/ParcelLedger'));
 const SeedlingBoard = lazy(() => import('../pages/SeedlingBoard'));
 const PlantingEntry = lazy(() => import('../pages/PlantingEntry'));
 const SurveyBoard = lazy(() => import('../pages/SurveyBoard'));
@@ -16,6 +17,7 @@ const ReplantPlan = lazy(() => import('../pages/ReplantPlan'));
 /** 路由路径常量：全项目唯一来源，避免手写字符串不一致 */
 export const ROUTES = {
   plots: '/plots',
+  parcels: '/parcels',
   seedlings: (plotId: string): string => `/plots/${plotId}/seedlings`,
   plantings: (plotId: string): string => `/plots/${plotId}/plantings`,
   surveys: '/surveys',
@@ -38,6 +40,7 @@ export const appRoutes: RouteObject[] = [
     children: [
       { index: true, element: <Navigate to={ROUTES.plots} replace /> },
       { path: 'plots', element: withSuspense(<PlotList />) },
+      { path: 'parcels', element: withSuspense(<ParcelLedger />) },
       { path: 'plots/:id/seedlings', element: withSuspense(<SeedlingBoard />) },
       { path: 'plots/:id/plantings', element: withSuspense(<PlantingEntry />) },
       { path: 'surveys', element: withSuspense(<SurveyBoard />) },

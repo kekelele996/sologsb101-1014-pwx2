@@ -9,6 +9,8 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Parcel } from '../types/parcel';
+import type { ParcelAdjustment } from '../types/parcelAdjustment';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -19,6 +21,7 @@ import {
   removePlot,
 } from '../utils/db';
 import { buildSurvivalSummary, type SurvivalSummary } from '../hooks/useSurvivalRate';
+import { buildLineageSummary, replantGate, type ReplantGate } from '../utils/parcelLinkage';
 import { nowIso, uuid } from '../utils/id';
 
 /** 地块筛选条件（关键字 + 潮位带 + 底质），由 <FilterBar> 同步到 URL query */
@@ -35,9 +38,9 @@ export interface PlotStat {
   seedlingCount: number;
   /** 进场苗木合计（株） */
   seedlingQuantity: number;
-  /** 栽植总株数（株） */
+  /** 栽植总株数（株，含并宗跨老地块聚合） */
   plantTotal: number;
-  /** 验收测次数 */
+  /** 验收测次数（并宗时为可对齐测次数） */
   surveyCount: number;
   /** 最新成活率（%） */
   latestRate: number;
@@ -47,6 +50,12 @@ export interface PlotStat {
   trend: number;
   /** 建议补植株数 */
   suggestReplant: number;
+  /** 是否只读（宗地回填不出 / 历史老地块） */
+  readOnly: boolean;
+  /** 关联宗地编号 */
+  parcelCode: string;
+  /** 补植闸门结果：挂起/只读期间不允许出补植计划 */
+  gate: ReplantGate;
 }
 
 const EMPTY_FILTERS: PlotFilters = { keyword: '', tideZone: 'all', substrate: 'all' };
@@ -74,6 +83,8 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  parcels: Parcel[];
+  adjustments: ParcelAdjustment[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -105,6 +116,9 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   level: 'poor',
   trend: 0,
   suggestReplant: 0,
+  readOnly: false,
+  parcelCode: '',
+  gate: { allowed: true, readOnly: false, reason: '' },
 };
 
 let subscribed = false;
@@ -114,6 +128,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  parcels: [],
+  adjustments: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,21 +146,25 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, parcels, adjustments] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.parcels.toArray(),
+            db.parcelAdjustments.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, parcels, adjustments };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, parcels, adjustments }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-              const summary = buildSurvivalSummary(plot.id, surveys, plantings);
+              // 谱系感知：并宗承接地块跨老地块按株数聚合；分宗新区用自身数据；老地块只读留历史
+              const summary = buildLineageSummary(plot, surveys, plantings, adjustments);
               summaries[plot.id] = summary;
+              const gate = replantGate(plot, adjustments, surveys, plantings);
               stats[plot.id] = {
                 plotId: plot.id,
                 seedlingCount: plotSeedlings.length,
@@ -155,6 +175,9 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
                 level: summary.level,
                 trend: summary.trend,
                 suggestReplant: summary.suggestReplant,
+                readOnly: plot.readOnly,
+                parcelCode: plot.parcelCode,
+                gate,
               };
             });
             const sorted = [...plots].sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
@@ -165,6 +188,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              parcels,
+              adjustments,
               stats,
               summaries,
               loading: false,
@@ -203,6 +228,10 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       substrate: draft.substrate,
       restoreMode: draft.restoreMode,
       state: draft.state,
+      // 新建地块若未关联宗地编号，先按只读挂起，待林业站确认后再放开
+      parcelCode: draft.parcelCode.trim(),
+      lineageRole: 'normal',
+      readOnly: draft.parcelCode.trim() === '',
       missingCount: 0,
       lastReplantDate: '',
       createdAt: stamp,
@@ -217,6 +246,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   async updatePlot(plotId, draft) {
     const existing = await db.plots.get(plotId);
     if (!existing) return;
+    const parcelCode = draft.parcelCode.trim();
     await putPlot({
       ...existing,
       name: draft.name.trim() || existing.name,
@@ -225,6 +255,9 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       substrate: draft.substrate,
       restoreMode: draft.restoreMode,
       state: draft.state,
+      // 谱系角色（并宗/分宗/历史）由重划记录驱动，普通编辑不改；仅同步宗地编号
+      parcelCode,
+      readOnly: existing.lineageRole === 'normal' ? parcelCode === '' : existing.readOnly,
     });
   },
 

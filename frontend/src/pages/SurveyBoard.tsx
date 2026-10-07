@@ -165,7 +165,10 @@ export default function SurveyBoard() {
       }
       setOpen(false);
     } catch (error) {
-      if (error instanceof Error) message.error(error.message);
+      if (error instanceof Error) {
+        // 只读 / 并宗地块录入被拦截时给出明确原因，不当作系统错误
+        message.warning(error.message, 5);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -187,7 +190,12 @@ export default function SurveyBoard() {
       return;
     }
     const result = await generateReplant(plotId);
-    message.success(result);
+    // 闸门拦截（挂起/只读/无对齐测次）以警告而非成功提示
+    if (result.includes('挂起') || result.includes('只读') || result.includes('待复核') || result.includes('接平')) {
+      message.warning(result, 6);
+    } else {
+      message.success(result);
+    }
   };
 
   const columns: ColumnsType<Survey> = [
@@ -199,8 +207,16 @@ export default function SurveyBoard() {
         <Space direction="vertical" size={0}>
           <span>{plotName(record.plotId)}</span>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {record.plotId && plots.find((p) => p.id === record.plotId)?.parcelCode
+              ? `宗地 ${plots.find((p) => p.id === record.plotId)?.parcelCode} · `
+              : ''}
             栽植总株数 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
           </Typography.Text>
+          {statOf(record.plotId).gate.allowed === false ? (
+            <Tag color="error" style={{ marginTop: 2 }}>
+              {statOf(record.plotId).readOnly ? '只读' : '挂起复核中'}
+            </Tag>
+          ) : null}
         </Space>
       ),
     },
@@ -275,9 +291,19 @@ export default function SurveyBoard() {
       title: '操作',
       key: 'action',
       width: 150,
-      render: (_value, record) => (
+      render: (_value, record) => {
+      const plotRow = plots.find((p) => p.id === record.plotId);
+      const readOnly = plotRow?.readOnly ?? false;
+      return (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={readOnly}
+            title={readOnly ? '只读地块（宗地待确认或历史老地块），历史验收不可改' : undefined}
+            onClick={() => openEdit(record)}
+          >
             编辑
           </Button>
           <Popconfirm
@@ -285,20 +311,29 @@ export default function SurveyBoard() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={readOnly}
             onConfirm={async () => {
               await deleteSurvey(record.id);
               await remove(record.id);
               message.success('验收记录已删除');
             }}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={readOnly}>
               删除
             </Button>
           </Popconfirm>
         </Space>
-      ),
+      );
+    },
     },
   ];
+
+  // 宗地重划挂起复核的地块：挂起期间不出补植计划
+  const adjustments = usePlotStore((state) => state.adjustments);
+  const heldAdjustments = adjustments.filter((adj) => adj.linkState === 'hold');
+  const heldPlotNames = heldAdjustments.flatMap((adj) =>
+    adj.successorPlotIds.map((id) => plots.find((plot) => plot.id === id)?.name).filter((n): n is string => Boolean(n)),
+  );
 
   const warnPlots = plots.filter((plot) => {
     const stat = statOf(plot.id);
@@ -343,6 +378,16 @@ export default function SurveyBoard() {
               ))}
             </Space>
           }
+        />
+      ) : null}
+
+      {heldPlotNames.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${heldAdjustments.length} 宗并宗/分宗记录挂起复核（${heldPlotNames.join('、')}）`}
+          description="新老宗地面积或同测次验收日期对不上，已挂起复核。挂起期间相关地块不出补植计划，历史栽植/验收仍只读可查。"
         />
       ) : null}
 

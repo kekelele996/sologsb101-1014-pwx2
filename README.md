@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -84,7 +84,8 @@ sologsb101-1014/
 
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
-| `/plots` | `pages/PlotList.tsx` | 修复地块台账：新建/编辑/级联删除、按潮位带与底质筛选、回显栽植总株数与最新成活率 |
+| `/plots` | `pages/PlotList.tsx` | 修复地块台账：新建/编辑/级联删除、按潮位带与底质筛选、回显栽植总株数与最新成活率、关联宗地编号与谱系角色 |
+| `/parcels` | `pages/ParcelLedger.tsx` | 林业站权属台账：宗地（编号/权属面积/四至）登记与并宗/分宗重划接账，自动接平、对不上挂起复核 |
 | `/plots/:id/seedlings` | `pages/SeedlingBoard.tsx` | 苗木批次与来源登记、批次数量累计校验（含密度提示） |
 | `/plots/:id/plantings` | `pages/PlantingEntry.tsx` | 栽植记录：录株距与株数、按面积与株距校验密度合理性 |
 | `/surveys` | `pages/SurveyBoard.tsx` | 成活率与株高验收台：按测次录入、自动算成活率、低于阈值告警、批量调整成活率等级 |
@@ -100,30 +101,40 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，
+  `version(3)` 接入林业站权属台账：
+  * v2：为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
+    回填 `revision` / `createdAt` / `updatedAt`；为 `plots` 补齐 `missingCount`、`lastReplantDate`；
+    为 `surveys` 补齐 `grade`、`gradeManual`（按 `survivalRate` 自动判定等级）。
+  * v3：新增 `parcels`（宗地）、`parcelAdjustments`（并宗/分宗重划）两张表；为 `plots` 增加
+    `parcelCode`（关联现行宗地）、`lineageRole`（常规/并宗合并/分宗承接/历史老地块）、`readOnly` 字段。
+    **升级回填**：已有地块没有宗地归属，按「原地块编号」回填一条 `source=legacyBackfill` 的历史宗地
+    （权属面积取地块面积、四至留空待补登）；回填不出宗地编号的个别地块 `parcelCode` 留空并置只读保留。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
-  | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt |
+  | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt, parcelCode, lineageRole |
   | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
   | `surveys` | id | plotId, [plotId+round], date, grade |
   | `replants` | id | plotId, planDate, state, species |
+  | `parcels` | id | parcelCode, status, source, areaMu |
+  | `parcelAdjustments` | id | mode, linkState, effectiveDate, [mode+linkState] |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
   * 3 个地块（东港南堤 3 号地块 / 西湾滩涂 A 区 / 北屿外滩 B 区），覆盖三种潮位带与三种底质；
   * 6 个苗木批次（每地块 2 批）、6 条栽植记录（每地块 2 条，引用真实批次 id）；
   * 7 条验收记录（每地块 2–3 个测次，成活率自洽：90.0% → 85.0% → 79.0% 等）；
-  * 3 条补植计划（覆盖待补植 / 已补植 / 已复核三种状态）。
+  * 3 个补植计划（覆盖待补植 / 已补植 / 已复核三种状态）。
   * 固定 id 如 `plot-donggang-3`、`plot-xiwan-a`、`plot-beiyu-b` 可直接用于深链验证。
+  * 另含 3 套宗地重划演示：南滩**并宗**（两宗测次对齐，分母 2000+2600=4600 株）、东海**并宗挂起**
+    （第 2 测次验收日期对不上，`roundMisaligned`，挂起期间不出补植计划）、西沙**分宗**
+    （一大宗拆两宗分属两班组，历史测次留老地块只读）。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的地块 id」这一界面偏好，不存业务数据。
-* 删除地块会**级联清理**其下的苗木批次、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）。
+* 删除地块会**级联清理**其下的苗木批次、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）；
+  林业站宗地与重划记录是独立权属台账，不随地块删除。
 
 ---
 
@@ -152,3 +163,20 @@ npm run preview      # 预览 dist 产物
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
 * **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
   并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+
+### 宗地重划（并宗 / 分宗）接账口径
+
+* **两本账分离**：林业站 `parcels` 管宗地编号、权属面积、四至；项目部 `plots` 管修复地块及其
+  栽植记录、验收测次、补植计划。二者经 `plots.parcelCode` 与 `parcelAdjustments` 重划映射连接。
+* **并宗分母按栽植总株数相加（不按权属面积加权）**：成活率是「活株/栽株」，株数可加，
+  分母 = 各老地块栽植总株数之和，分子 = 同测次+同验收日期对齐后的成活株数之和；
+  面积只做权属守恒校验（新≈老合计，容差 5%），不进成活率公式。
+* **分宗历史测次归老地块**：分宗前的验收是整块地的整体抽样，无法物理切分，
+  一律留在被拆老地块名下只读，不划归任一新地块；新地块自生效日各自重新起测。
+* **对不上先挂起复核，挂起期间不出补植计划**：地块/宗地缺失、面积超差、并宗测次对不上
+  即置 `hold`（补植闸门 `replantGate` 拦截验收台与补植页的生成动作）；历史栽植/验收仍只读可查。
+* **升级回填**：老数据无宗地归属，v3 按原地块编号回填历史宗地；回填不出的地块 `parcelCode`
+  留空、置只读保留，待林业站确认后人工关联再放开。
+
+> 决策细节与原因码见 [`docs/parcel-linkage.md`](docs/parcel-linkage.md)，
+> 纯逻辑集中在 `src/utils/parcelLinkage.ts`（接平校验 / 并宗聚合 / 分宗归属 / 补植闸门）。

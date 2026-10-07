@@ -67,8 +67,9 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     };
   }
-  const collections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
-  for (const key of collections) {
+  // v3 起新增宗地与重划两表；旧档（v1/v2）允许缺省，导入时按空集处理
+  const requiredCollections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
+  for (const key of requiredCollections) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
@@ -86,6 +87,7 @@ export function exportSummaryCsv(
 ): string {
   const header = [
     '地块名',
+    '宗地编号',
     '面积(亩)',
     '潮位带',
     '底质',
@@ -116,6 +118,7 @@ export function exportSummaryCsv(
     lines.push(
       [
         plot.name,
+        plot.parcelCode || '（待确认）',
         plot.areaMu,
         plot.tideZone,
         plot.substrate,

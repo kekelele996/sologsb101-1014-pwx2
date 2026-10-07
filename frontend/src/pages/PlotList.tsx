@@ -35,7 +35,9 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import RateTag from '../components/common/RateTag';
 import StatBadge from '../components/common/StatBadge';
 import { usePlotStore } from '../stores/plotStore';
+import { useParcelStore } from '../stores/parcelStore';
 import {
+  PLOT_LINEAGE_ROLE_LABEL,
   PLOT_STATE_OPTIONS,
   RESTORE_MODE_OPTIONS,
   SUBSTRATE_OPTIONS,
@@ -53,6 +55,7 @@ const DEFAULT_DRAFT: PlotDraft = {
   substrate: '淤泥质',
   restoreMode: '造林',
   state: '跟踪中',
+  parcelCode: '',
 };
 
 export default function PlotList() {
@@ -69,6 +72,7 @@ export default function PlotList() {
   const updatePlot = usePlotStore((state) => state.updatePlot);
   const deletePlot = usePlotStore((state) => state.deletePlot);
   const selectPlot = usePlotStore((state) => state.selectPlot);
+  const parcels = useParcelStore((state) => state.parcels);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Plot | null>(null);
@@ -103,6 +107,7 @@ export default function PlotList() {
       substrate: plot.substrate,
       restoreMode: plot.restoreMode,
       state: plot.state,
+      parcelCode: plot.parcelCode,
     });
     setOpen(true);
   };
@@ -153,6 +158,7 @@ export default function PlotList() {
           </Typography.Link>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {record.restoreMode} · {record.substrate}
+            {record.readOnly ? ' · 只读' : ''}
           </Typography.Text>
         </Space>
       ),
@@ -164,6 +170,26 @@ export default function PlotList() {
       width: 96,
       align: 'right',
       sorter: (a, b) => a.areaMu - b.areaMu,
+    },
+    {
+      title: '宗地编号',
+      key: 'parcelCode',
+      width: 180,
+      render: (_value, record) =>
+        record.parcelCode ? (
+          <Space direction="vertical" size={0}>
+            <Typography.Text copyable={{ text: record.parcelCode }} style={{ fontSize: 13 }}>
+              {record.parcelCode}
+            </Typography.Text>
+            {record.lineageRole !== 'normal' ? (
+              <Tag color={record.lineageRole === 'mergeTarget' ? 'purple' : record.lineageRole === 'splitChild' ? 'magenta' : 'default'} style={{ marginTop: 2 }}>
+                {PLOT_LINEAGE_ROLE_LABEL[record.lineageRole]}
+              </Tag>
+            ) : null}
+          </Space>
+        ) : (
+          <Tag color="warning">宗地待确认 · 只读</Tag>
+        ),
     },
     {
       title: '潮位带',
@@ -381,6 +407,20 @@ export default function PlotList() {
             rules={[{ required: true, message: '请填写地块名' }, { max: 40, message: '地块名不超过 40 字' }]}
           >
             <Input placeholder="如：东港南堤 3 号地块" />
+          </Form.Item>
+          <Form.Item
+            name="parcelCode"
+            label="关联宗地编号（林业站权属台账）"
+            extra="留空时地块先按只读保留，待林业站确认宗地后再放开栽植/验收/补植。"
+          >
+            <Select
+              showSearch
+              allowClear
+              placeholder="选择现行宗地编号（可先在权属台账登记）"
+              options={parcels
+                .filter((parcel) => parcel.status === 'active')
+                .map((parcel) => ({ value: parcel.parcelCode, label: `${parcel.parcelCode}（${parcel.areaMu} 亩）` }))}
+            />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item

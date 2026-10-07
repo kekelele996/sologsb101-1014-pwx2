@@ -264,7 +264,14 @@ export default function PlantingEntry() {
       width: 150,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={plot.readOnly}
+            title={plot.readOnly ? '只读地块（宗地待确认或历史老地块），历史栽植不可改' : undefined}
+            onClick={() => openEdit(record)}
+          >
             编辑
           </Button>
           <Popconfirm
@@ -272,12 +279,13 @@ export default function PlantingEntry() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={plot.readOnly}
             onConfirm={async () => {
               await remove(record.id);
               message.success('栽植记录已删除');
             }}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={plot.readOnly}>
               删除
             </Button>
           </Popconfirm>
@@ -314,6 +322,20 @@ export default function PlantingEntry() {
         />
       </div>
 
+      {plot.readOnly ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="该地块为只读（宗地待确认或并宗/分宗后的历史老地块）"
+          description={
+            plot.parcelCode === ''
+              ? '升级时回填不出权属宗地，栽植记录只读保留；待林业站确认宗地编号并关联后可恢复。'
+              : '其栽植与历史验收作为重划前档案只读保留；补植与新验收请到承接地块办理。'
+          }
+        />
+      ) : null}
+
       {plotSeedlings.length === 0 ? (
         <Alert
           type="warning"
@@ -332,7 +354,13 @@ export default function PlantingEntry() {
       <Card
         title="栽植记录"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={plotSeedlings.length === 0 || plot.readOnly}
+            title={plot.readOnly ? '只读地块不能新增栽植记录' : undefined}
+            onClick={openCreate}
+          >
             新增栽植记录
           </Button>
         }

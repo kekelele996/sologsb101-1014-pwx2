@@ -207,7 +207,14 @@ export default function SeedlingBoard() {
       width: 170,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={plot.readOnly}
+            title={plot.readOnly ? '只读地块，苗木批次不可改' : undefined}
+            onClick={() => openEdit(record)}
+          >
             编辑
           </Button>
           <Popconfirm
@@ -216,9 +223,10 @@ export default function SeedlingBoard() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={plot.readOnly}
             onConfirm={() => void handleDelete(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={plot.readOnly}>
               删除
             </Button>
           </Popconfirm>
@@ -273,10 +281,20 @@ export default function SeedlingBoard() {
         />
       ) : null}
 
+      {plot.readOnly ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="该地块为只读（宗地待确认或并宗/分宗后的历史老地块）"
+          description="苗木批次作为历史档案只读保留；新业务请到承接地块办理。"
+        />
+      ) : null}
+
       <Card
         title="苗木批次与来源"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plot.readOnly}>
             登记苗木批次
           </Button>
         }

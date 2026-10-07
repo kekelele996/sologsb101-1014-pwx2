@@ -8,6 +8,7 @@ import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import {
   AppstoreOutlined,
   BarChartOutlined,
+  BookOutlined,
   DashboardOutlined,
   ExperimentOutlined,
   ToolOutlined,
@@ -16,12 +17,14 @@ import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
 import { useSurveyStore } from './stores/surveyStore';
+import { useParcelStore } from './stores/parcelStore';
 import { percentText } from './utils/rate';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 /** 按当前路径推导高亮的导航项 */
 function selectedKey(pathname: string): string {
+  if (pathname.startsWith('/parcels')) return ROUTES.parcels;
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
@@ -39,12 +42,14 @@ export default function App() {
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
+  const initParcel = useParcelStore((state) => state.init);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+    void initParcel();
+  }, [loadAll, initSurvey, initReplant, initParcel]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -68,6 +73,7 @@ export default function App() {
           onClick={({ key }) => navigate(key)}
           items={[
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
+            { key: ROUTES.parcels, icon: <BookOutlined />, label: '林业站权属台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
           ]}
@@ -80,7 +86,7 @@ export default function App() {
             <BarChartOutlined /> 栽植 {counts.plantings ?? 0} · 验收 {counts.surveys ?? 0}
           </div>
           <div>
-            <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
+            <ToolOutlined /> 补植 {counts.replants ?? 0} · 宗地 {counts.parcels ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
           </div>
         </div>
       </Sider>

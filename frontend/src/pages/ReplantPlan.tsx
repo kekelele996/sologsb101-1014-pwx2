@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -160,7 +161,7 @@ export default function ReplantPlan() {
       }
       setOpen(false);
     } catch (error) {
-      if (error instanceof Error) message.error(error.message);
+      if (error instanceof Error) message.warning(error.message, 6);
     } finally {
       setSubmitting(false);
     }
@@ -226,6 +227,13 @@ export default function ReplantPlan() {
             {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
             栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
           </Typography.Text>
+          {statOf(record.plotId).gate.allowed === false ? (
+            <Tooltip title={statOf(record.plotId).gate.reason}>
+              <Tag color="error" style={{ marginTop: 2 }}>
+                {statOf(record.plotId).gate.readOnly ? '只读 · 不出补植' : '挂起复核中 · 不出补植'}
+              </Tag>
+            </Tooltip>
+          ) : null}
         </Space>
       ),
     },
