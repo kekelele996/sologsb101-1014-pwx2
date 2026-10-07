@@ -207,7 +207,13 @@ export default function SeedlingBoard() {
       width: 170,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={plot?.readonly === true}
+            onClick={() => openEdit(record)}
+          >
             编辑
           </Button>
           <Popconfirm
@@ -216,9 +222,10 @@ export default function SeedlingBoard() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={plot?.readonly === true}
             onConfirm={() => void handleDelete(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={plot?.readonly === true}>
               删除
             </Button>
           </Popconfirm>
@@ -273,10 +280,20 @@ export default function SeedlingBoard() {
         />
       ) : null}
 
+      {plot.readonly === true ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="该地块历史宗地回填不上，已只读保留"
+          description="苗木批次仅可查看，不能新增、修改或删除；请到权属宗地台账完成复核对接。"
+        />
+      ) : null}
+
       <Card
         title="苗木批次与来源"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plot.readonly === true}>
             登记苗木批次
           </Button>
         }

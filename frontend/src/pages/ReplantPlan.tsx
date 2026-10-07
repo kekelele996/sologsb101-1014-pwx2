@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -43,6 +44,7 @@ import { DB_NAME, DB_SCHEMA_VERSION, db } from '../utils/db';
 import { REPLANT_STATE_OPTIONS, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
 import { SEEDLING_SPECIES_OPTIONS, type SeedlingSpecies } from '../types/seedling';
 import { exportSnapshotJson, exportSummaryCsvFile, parseSnapshot } from '../utils/export';
+import { replantBlockReason, replantBlockText } from '../utils/parcel';
 import { percentText } from '../utils/rate';
 
 interface ReplantFormValues {
@@ -61,6 +63,15 @@ export default function ReplantPlan() {
   const surveys = usePlotStore((state) => state.surveys);
   const statOf = usePlotStore((state) => state.statOf);
   const ready = usePlotStore((state) => state.ready);
+  const parcels = usePlotStore((state) => state.parcels);
+  const parcelLinks = usePlotStore((state) => state.parcelLinks);
+
+  /** 地块补植冻结原因（挂起 / 只读 / 分宗母块 / 无宗地），null 为可出计划 */
+  const blockReasonOf = (plotId: string) => {
+    const plot = plots.find((item) => item.id === plotId);
+    if (plot === undefined) return 'readonly' as const;
+    return replantBlockReason(plot, parcels, parcelLinks);
+  };
 
   const filters = useReplantStore((state) => state.filters);
   const setFilters = useReplantStore((state) => state.setFilters);
@@ -106,13 +117,16 @@ export default function ReplantPlan() {
     const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
     const reviewed = rows.filter((row) => row.state === '已复核').length;
     const pending = rows.filter((row) => row.state === '待补植').length;
+    const blockedPlans = rows.filter((row) => blockReasonOf(row.plotId) !== null).length;
     return {
       missing,
       pending,
       reviewed,
+      blockedPlans,
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
-  }, [rows]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, plots, parcels, parcelLinks]);
 
   const openCreate = (): void => {
     setEditing(null);
@@ -143,6 +157,14 @@ export default function ReplantPlan() {
   const handleSubmit = async (): Promise<void> => {
     try {
       const values = await form.validateFields();
+      const reason = blockReasonOf(values.plotId);
+      if (reason !== null) {
+        const held = parcels.find(
+          (item) => item.status === '挂起复核' && parcelLinks.some((link) => link.parcelId === item.id && link.plotId === values.plotId),
+        );
+        message.error(replantBlockText(reason, held));
+        return;
+      }
       setSubmitting(true);
       const payload: ReplantDraft = {
         plotId: values.plotId,
@@ -182,7 +204,15 @@ export default function ReplantPlan() {
   };
 
   const handleExportCsv = (): void => {
-    const filename = exportSummaryCsvFile(plots, seedlings, plantings, surveys, rows);
+    const filename = exportSummaryCsvFile(
+      plots,
+      seedlings,
+      plantings,
+      surveys,
+      rows,
+      usePlotStore.getState().parcels,
+      usePlotStore.getState().parcelLinks,
+    );
     message.success(`已导出成活率汇总 ${filename}`);
   };
 
@@ -217,17 +247,30 @@ export default function ReplantPlan() {
     {
       title: '地块',
       key: 'plot',
-      width: 200,
-      render: (_value, record) => (
-        <Space direction="vertical" size={0}>
-          <span>{plotName(record.plotId)}</span>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            最新成活率{' '}
-            {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
-            栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
-          </Typography.Text>
-        </Space>
-      ),
+      width: 230,
+      render: (_value, record) => {
+        const reason = blockReasonOf(record.plotId);
+        const held = parcels.find(
+          (item) => item.status === '挂起复核' && parcelLinks.some((link) => link.parcelId === item.id && link.plotId === record.plotId),
+        );
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{plotName(record.plotId)}</span>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              最新成活率{' '}
+              {statOf(record.plotId).surveyCount > 0 ? percentText(statOf(record.plotId).latestRate) : '未验收'} ·
+              栽植 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
+            </Typography.Text>
+            {reason !== null ? (
+              <Tooltip title={replantBlockText(reason, held)}>
+                <Tag color="error" style={{ marginTop: 2 }}>
+                  {reason === 'parcel-held' ? '宗地挂起·不出补植' : reason === 'split-parent' ? '分宗母块·留档' : reason === 'readonly' ? '只读保留' : '未挂宗地'}
+                </Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '缺株数（株）',
@@ -340,7 +383,7 @@ export default function ReplantPlan() {
             size="small"
             type="link"
             icon={<SyncOutlined />}
-            disabled={record.state === '已复核'}
+            disabled={record.state === '已复核' || blockReasonOf(record.plotId) !== null}
             onClick={() => void handleAdvance(record)}
           >
             推进状态
@@ -388,6 +431,16 @@ export default function ReplantPlan() {
           hint="IndexedDB 库名与结构版本号；升级时会按 version().stores() 自动迁移"
         />
       </div>
+
+      {stats.blockedPlans > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${stats.blockedPlans} 条补植计划关联的地块处于挂起 / 只读 / 分宗母块 / 未挂宗地状态`}
+          description="挂起复核期间不出补植计划、不能推进状态；待权属台账复核通过后自动解冻。"
+        />
+      ) : null}
 
       {lastMessage !== '' ? (
         <Alert type="info" showIcon style={{ marginBottom: 14 }} message={lastMessage} />
@@ -491,7 +544,19 @@ export default function ReplantPlan() {
       >
         <Form form={form} layout="vertical">
           <Form.Item name="plotId" label="地块" rules={[{ required: true, message: '请选择地块' }]}>
-            <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
+            <Select
+              options={plots.map((plot) => {
+                const reason = replantBlockReason(plot, parcels, parcelLinks);
+                return {
+                  value: plot.id,
+                  label:
+                    reason === null
+                      ? plot.name
+                      : `${plot.name}（${reason === 'parcel-held' ? '宗地挂起' : reason === 'split-parent' ? '分宗母块' : reason === 'readonly' ? '只读保留' : '未挂宗地'}，不可出计划）`,
+                  disabled: reason !== null,
+                };
+              })}
+            />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item

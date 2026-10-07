@@ -264,7 +264,13 @@ export default function PlantingEntry() {
       width: 150,
       render: (_value, record) => (
         <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button
+            size="small"
+            type="link"
+            icon={<EditOutlined />}
+            disabled={plot.readonly === true}
+            onClick={() => openEdit(record)}
+          >
             编辑
           </Button>
           <Popconfirm
@@ -272,12 +278,13 @@ export default function PlantingEntry() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={plot.readonly === true}
             onConfirm={async () => {
               await remove(record.id);
               message.success('栽植记录已删除');
             }}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={plot.readonly === true}>
               删除
             </Button>
           </Popconfirm>
@@ -329,10 +336,25 @@ export default function PlantingEntry() {
         />
       ) : null}
 
+      {plot.readonly === true ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="该地块历史宗地回填不上，已只读保留"
+          description="栽植记录仅可查看，不能新增、修改或删除；请到权属宗地台账完成复核对接后再操作。"
+        />
+      ) : null}
+
       <Card
         title="栽植记录"
         extra={
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={openCreate}
+            disabled={plotSeedlings.length === 0 || plot.readonly === true}
+          >
             新增栽植记录
           </Button>
         }

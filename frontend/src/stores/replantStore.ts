@@ -14,10 +14,12 @@ import {
   putReplant,
   removeReplant,
   resetDatabase,
+  ROW_REVISION,
   type DatabaseSnapshot,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
 import { usePlotStore } from './plotStore';
+import { replantBlockReason, replantBlockText } from '../utils/parcel';
 
 /** 补植计划筛选条件 */
 export interface ReplantFilters {
@@ -104,6 +106,17 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   },
 
   async createReplant(draft) {
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((item) => item.id === draft.plotId);
+    if (plot !== undefined) {
+      const reason = replantBlockReason(plot, plotState.parcels, plotState.parcelLinks);
+      if (reason !== null) {
+        const held = plotState.parcels.find(
+          (item) => item.status === '挂起复核' && plotState.parcelLinks.some((link) => link.parcelId === item.id && link.plotId === draft.plotId),
+        );
+        throw new Error(replantBlockText(reason, held));
+      }
+    }
     const stamp = nowIso();
     const row: Replant = {
       id: uuid('replant'),
@@ -114,7 +127,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putReplant(row);
     set({ revision: get().revision + 1 });
@@ -136,6 +149,18 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     const index = FLOW.indexOf(existing.state);
     if (index < 0 || index >= FLOW.length - 1) return null;
     const next = FLOW[index + 1];
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((item) => item.id === existing.plotId);
+    if (plot !== undefined) {
+      const reason = replantBlockReason(plot, plotState.parcels, plotState.parcelLinks);
+      if (reason !== null) {
+        const held = plotState.parcels.find(
+          (item) => item.status === '挂起复核' && plotState.parcelLinks.some((link) => link.parcelId === item.id && link.plotId === existing.plotId),
+        );
+        set({ lastMessage: replantBlockText(reason, held) });
+        return null;
+      }
+    }
     await advanceReplantState(replantId, next);
     await usePlotStore.getState().refreshCounts();
     set({

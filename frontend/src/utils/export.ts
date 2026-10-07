@@ -9,8 +9,12 @@ import type { Survey } from '../types/survey';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import type { Replant } from '../types/replant';
+import type { Parcel } from '../types/parcel';
+import type { ParcelLink } from '../types/parcelLink';
 import { RATE_LEVEL_LABEL } from '../types/survey';
+import { PARCEL_LINK_TYPE_LABEL } from '../types/parcelLink';
 import { calcSurvivalRate, percentText, round1 } from './rate';
+import { replantBlockText } from './parcel';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -76,13 +80,15 @@ export function parseSnapshot(text: string): SnapshotParseResult {
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
 }
 
-/** 导出全部地块的成活率汇总 CSV */
+/** 导出全部地块的成活率汇总 CSV（含权属宗地对接口径） */
 export function exportSummaryCsv(
   plots: Plot[],
   seedlings: Seedling[],
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  parcels: Parcel[] = [],
+  parcelLinks: ParcelLink[] = [],
 ): string {
   const header = [
     '地块名',
@@ -91,6 +97,11 @@ export function exportSummaryCsv(
     '底质',
     '修复方式',
     '状态',
+    '宗地编号',
+    '权属面积(亩)',
+    '挂接形态',
+    '宗地状态',
+    '补植冻结',
     '苗木批次数',
     '进场苗木合计(株)',
     '栽植总株数(株)',
@@ -110,9 +121,21 @@ export function exportSummaryCsv(
     const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const plotReplants = replants.filter((row) => row.plotId === plot.id);
+    const ownLinks = parcelLinks.filter((link) => link.plotId === plot.id);
+    const linkedParcels = parcels.filter((parcel) => ownLinks.some((link) => link.parcelId === parcel.id));
+    const heldParcel = linkedParcels.find((parcel) => parcel.status === '挂起复核');
+    const parcelCodes = linkedParcels.map((parcel) => parcel.parcelCode).join(' / ') || '未挂接';
+    const parcelArea = linkedParcels.reduce((acc, parcel) => acc + parcel.areaMu, 0);
+    const linkShapes = Array.from(new Set(ownLinks.map((link) => PARCEL_LINK_TYPE_LABEL[link.linkType]))).join(' / ') || '—';
+    const parcelStatus = Array.from(new Set(linkedParcels.map((parcel) => parcel.status))).join(' / ') || '—';
     const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    let frozen = '';
+    if (plot.readonly === true) frozen = replantBlockText('readonly');
+    else if (ownLinks.some((link) => link.linkType === 'split-parent')) frozen = replantBlockText('split-parent');
+    else if (heldParcel !== undefined) frozen = replantBlockText('parcel-held', heldParcel);
+    else if (linkedParcels.length === 0) frozen = replantBlockText('no-parcel');
     lines.push(
       [
         plot.name,
@@ -121,6 +144,11 @@ export function exportSummaryCsv(
         plot.substrate,
         plot.restoreMode,
         plot.state,
+        parcelCodes,
+        parcelArea || '',
+        linkShapes,
+        parcelStatus,
+        frozen,
         plotSeedlings.length,
         plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
         total,
@@ -138,7 +166,7 @@ export function exportSummaryCsv(
         .join(','),
     );
   });
-  return `\uFEFF${lines.join('\n')}`;
+  return `﻿${lines.join('\n')}`;
 }
 
 /** 导出成活率汇总 CSV 文件 */
@@ -148,9 +176,15 @@ export function exportSummaryCsvFile(
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  parcels: Parcel[] = [],
+  parcelLinks: ParcelLink[] = [],
 ): string {
   const filename = `红树林成活率汇总-${stampSuffix()}.csv`;
-  download(filename, exportSummaryCsv(plots, seedlings, plantings, surveys, replants), 'text/csv;charset=utf-8');
+  download(
+    filename,
+    exportSummaryCsv(plots, seedlings, plantings, surveys, replants, parcels, parcelLinks),
+    'text/csv;charset=utf-8',
+  );
   return filename;
 }
 

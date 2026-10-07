@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbmangrove
- * - 含数据结构版本号与 v1 → v2 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - 含数据结构版本号与 v1 → v2 → v3 升级迁移逻辑（升级时按 version().stores() 补齐索引）
+ * - v3：林业站权属宗地（parcels）与宗地—地块挂接关系（parcelLinks）
  * - 提供各表增删改查、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -11,7 +12,10 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
+import type { Parcel } from '../types/parcel';
+import type { ParcelLink } from '../types/parcelLink';
 import { rateLevel } from './rate';
+import { replantBlockReason } from './parcel';
 import { nowIso, today } from './id';
 import { seedDatabase } from './seed';
 
@@ -19,10 +23,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
@@ -30,6 +34,8 @@ class MangroveDatabase extends Dexie {
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
+  parcels!: Table<Parcel, string>;
+  parcelLinks!: Table<ParcelLink, string>;
 
   constructor() {
     super(DB_NAME);
@@ -81,10 +87,91 @@ class MangroveDatabase extends Dexie {
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
         });
       });
+
+    // ---------- v3：林业站权属宗地 + 宗地—地块挂接，按原地块编号回填历史宗地 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+        parcels: 'id, parcelCode, ownerName, status, effectiveDate',
+        parcelLinks: 'id, parcelId, plotId, linkType',
+      })
+      .upgrade(async (tx) => {
+        await backfillHistoricParcels({
+          plots: tx.table('plots'),
+          parcels: tx.table('parcels'),
+          parcelLinks: tx.table('parcelLinks'),
+        });
+      });
   }
 }
 
 export const db = new MangroveDatabase();
+
+/* --------------------- 历史宗地回填（v3 升级 / 老快照导入共用） --------------------- */
+
+export interface ParcelBackfillAccessor {
+  plots: Pick<Table<Plot, string>, 'toArray' | 'bulkPut'>;
+  parcels: Pick<Table<Parcel, string>, 'bulkPut'>;
+  parcelLinks: Pick<Table<ParcelLink, string>, 'bulkPut'>;
+}
+
+/**
+ * 已有数据没有宗地归属时：按原地块编号回填历史宗地（宗地编号沿用原地块 id），
+ * 并建 direct 一一对应挂接；回填不出的地块（编号 / 面积无效）置只读保留。
+ * 返回回填宗地数与置只读的地块数。
+ */
+export async function backfillHistoricParcels(accessor: ParcelBackfillAccessor): Promise<{
+  parcelCount: number;
+  readonlyPlotCount: number;
+}> {
+  const plots = await accessor.plots.toArray();
+  const stamp = nowIso();
+  const parcels: Parcel[] = [];
+  const links: ParcelLink[] = [];
+  const readonlyPlots: Plot[] = [];
+
+  for (const plot of plots) {
+    const code = String(plot.id ?? '').trim();
+    if (code === '' || typeof plot.areaMu !== 'number' || !(plot.areaMu > 0)) {
+      readonlyPlots.push({ ...plot, readonly: true, updatedAt: stamp, revision: ROW_REVISION });
+      continue;
+    }
+    parcels.push({
+      id: `parcel-hist-${code}`,
+      parcelCode: code,
+      ownerName: '历史权属（待林业站核对）',
+      areaMu: plot.areaMu,
+      boundaries: '',
+      effectiveDate: '',
+      status: '正常',
+      holdReason: '',
+      source: 'upgrade-backfill',
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    });
+    links.push({
+      id: `plink-hist-${code}`,
+      parcelId: `parcel-hist-${code}`,
+      plotId: code,
+      linkType: 'direct',
+      team: '',
+      splitAreaMu: 0,
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    });
+  }
+
+  if (parcels.length > 0) await accessor.parcels.bulkPut(parcels);
+  if (links.length > 0) await accessor.parcelLinks.bulkPut(links);
+  if (readonlyPlots.length > 0) await accessor.plots.bulkPut(readonlyPlots);
+  return { parcelCount: parcels.length, readonlyPlotCount: readonlyPlots.length };
+}
 
 /* ------------------------------ 初始化与播种 ------------------------------ */
 
@@ -126,15 +213,61 @@ export async function patchPlot(id: string, patch: Partial<Plot>): Promise<void>
   await db.plots.update(id, { ...patch, updatedAt: nowIso() });
 }
 
-/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划 */
+/** 删除地块并级联清理其下苗木批次、栽植、验收、补植计划与宗地挂接边 */
 export async function removePlot(id: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await db.seedlings.where('plotId').equals(id).delete();
-    await db.plantings.where('plotId').equals(id).delete();
-    await db.surveys.where('plotId').equals(id).delete();
-    await db.replants.where('plotId').equals(id).delete();
-    await db.plots.delete(id);
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.parcelLinks],
+    async () => {
+      await db.seedlings.where('plotId').equals(id).delete();
+      await db.plantings.where('plotId').equals(id).delete();
+      await db.surveys.where('plotId').equals(id).delete();
+      await db.replants.where('plotId').equals(id).delete();
+      await db.parcelLinks.where('plotId').equals(id).delete();
+      await db.plots.delete(id);
+    },
+  );
+}
+
+/* ------------------------------ 权属宗地 ------------------------------ */
+
+export async function listParcels(): Promise<Parcel[]> {
+  const rows = await db.parcels.toArray();
+  return rows.sort((a, b) => a.parcelCode.localeCompare(b.parcelCode, 'zh-Hans-CN'));
+}
+
+export async function getParcel(id: string): Promise<Parcel | undefined> {
+  return db.parcels.get(id);
+}
+
+export async function putParcel(row: Parcel): Promise<void> {
+  await db.parcels.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+/** 删除宗地并级联清理其挂接边（地块 / 栽植 / 验收不动，权属台账只管台账侧） */
+export async function removeParcel(id: string): Promise<void> {
+  await db.transaction('rw', db.parcels, db.parcelLinks, async () => {
+    await db.parcelLinks.where('parcelId').equals(id).delete();
+    await db.parcels.delete(id);
   });
+}
+
+/* --------------------------- 宗地—地块挂接 --------------------------- */
+
+export async function listParcelLinks(): Promise<ParcelLink[]> {
+  return db.parcelLinks.toArray();
+}
+
+export async function listLinksByParcel(parcelId: string): Promise<ParcelLink[]> {
+  return db.parcelLinks.where('parcelId').equals(parcelId).toArray();
+}
+
+export async function putParcelLink(row: ParcelLink): Promise<void> {
+  await db.parcelLinks.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeParcelLink(id: string): Promise<void> {
+  await db.parcelLinks.delete(id);
 }
 
 /* ------------------------------ 苗木批次 ------------------------------ */
@@ -270,6 +403,18 @@ export async function applyReplantCompletion(replantId: string): Promise<void> {
 
 /** 推进补植状态（待补植 → 已补植 → 已复核），推进到「已补植」时触发回写 */
 export async function advanceReplantState(replantId: string, next: ReplantState): Promise<void> {
+  // 硬防线：地块处于挂起 / 只读 / 分宗母块 / 无宗地时，禁止推进补植（挂起期间不出补植计划）
+  if (next !== '已复核') {
+    const replant = await db.replants.get(replantId);
+    if (replant !== undefined) {
+      const [plot, parcels, links] = await Promise.all([
+        db.plots.get(replant.plotId),
+        db.parcels.toArray(),
+        db.parcelLinks.toArray(),
+      ]);
+      if (plot !== undefined && replantBlockReason(plot, parcels, links) !== null) return;
+    }
+  }
   await db.replants.update(replantId, { state: next, updatedAt: nowIso() });
   if (next === '已补植') {
     await applyReplantCompletion(replantId);
@@ -287,16 +432,21 @@ export interface DatabaseSnapshot {
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
+  /** v3 起导出；v2 老存档缺这两项，导入时按原地块编号回填历史宗地 */
+  parcels?: Parcel[];
+  parcelLinks?: ParcelLink[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, parcels, parcelLinks] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
+    db.parcels.toArray(),
+    db.parcelLinks.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -307,49 +457,78 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     plantings,
     surveys,
     replants,
+    parcels,
+    parcelLinks,
   };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；v2 老存档没有宗地归属时按原地块编号回填，回填不出的只读保留 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await Promise.all([
-      db.plots.clear(),
-      db.seedlings.clear(),
-      db.plantings.clear(),
-      db.surveys.clear(),
-      db.replants.clear(),
-    ]);
-    await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
-  });
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.parcels, db.parcelLinks],
+    async () => {
+      await Promise.all([
+        db.plots.clear(),
+        db.seedlings.clear(),
+        db.plantings.clear(),
+        db.surveys.clear(),
+        db.replants.clear(),
+        db.parcels.clear(),
+        db.parcelLinks.clear(),
+      ]);
+      await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
+
+      const parcelRows = snapshot.parcels ?? [];
+      const linkRows = snapshot.parcelLinks ?? [];
+      if (parcelRows.length > 0) {
+        await db.parcels.bulkPut(parcelRows.map((row) => ({ ...row, revision: ROW_REVISION })));
+      }
+      if (linkRows.length > 0) {
+        await db.parcelLinks.bulkPut(linkRows.map((row) => ({ ...row, revision: ROW_REVISION })));
+      }
+      // 老存档（或残缺存档）没有宗地归属：按原地块编号回填历史宗地，回填不出的置只读
+      if (parcelRows.length === 0 && snapshot.plots.length > 0) {
+        await backfillHistoricParcels({ plots: db.plots, parcels: db.parcels, parcelLinks: db.parcelLinks });
+      }
+    },
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await Promise.all([
-      db.plots.clear(),
-      db.seedlings.clear(),
-      db.plantings.clear(),
-      db.surveys.clear(),
-      db.replants.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.parcels, db.parcelLinks],
+    async () => {
+      await Promise.all([
+        db.plots.clear(),
+        db.seedlings.clear(),
+        db.plantings.clear(),
+        db.surveys.clear(),
+        db.replants.clear(),
+        db.parcels.clear(),
+        db.parcelLinks.clear(),
+      ]);
+    },
+  );
   await seedDatabase();
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, parcels, parcelLinks] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
+    db.parcels.count(),
+    db.parcelLinks.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, plantings, surveys, replants, parcels, parcelLinks };
 }

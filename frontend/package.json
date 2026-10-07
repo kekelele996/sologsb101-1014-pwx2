@@ -8,7 +8,8 @@
     "dev": "vite --host --port 22814",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22814",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:migration": "esbuild scripts/app-exports.ts --bundle --platform=node --format=esm --outfile=scripts/app-bundle.mjs --log-level=warning && node scripts/verify-migration.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^5.5.1",

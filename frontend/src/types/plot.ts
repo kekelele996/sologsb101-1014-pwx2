@@ -38,6 +38,11 @@ export interface Plot {
   missingCount: number;
   /** 最近一次补植/复壮回写日期 */
   lastReplantDate: string;
+  /**
+   * 只读保留：v3 升级时按原地块编号回填历史宗地失败（对不上）的地块置为只读，
+   * 只读保留历史栽植 / 验收数据，不允许编辑、删除、录测次、出补植计划。
+   */
+  readonly?: boolean;
   createdAt: string;
   updatedAt: string;
   /** 数据行结构修订号，便于后续按行迁移 */

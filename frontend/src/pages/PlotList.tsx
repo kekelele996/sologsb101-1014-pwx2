@@ -5,6 +5,7 @@
  */
 import { useMemo, useState } from 'react';
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -17,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -25,9 +27,11 @@ import {
   EditOutlined,
   EnvironmentOutlined,
   ExperimentOutlined,
+  LockOutlined,
   PlusOutlined,
   RiseOutlined,
   FallOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import FilterBar from '../components/common/FilterBar';
@@ -44,6 +48,7 @@ import {
   type PlotDraft,
 } from '../types/plot';
 import { ROUTES } from '../router';
+import { replantBlockText } from '../utils/parcel';
 import { percentText } from '../utils/rate';
 
 const DEFAULT_DRAFT: PlotDraft = {
@@ -95,6 +100,10 @@ export default function PlotList() {
   };
 
   const openEdit = (plot: Plot): void => {
+    if (plot.readonly === true) {
+      message.warning('该地块历史宗地回填不上，已只读保留，不能编辑；请到权属宗地台账复核。');
+      return;
+    }
     setEditing(plot);
     form.setFieldsValue({
       name: plot.name,
@@ -127,6 +136,10 @@ export default function PlotList() {
   };
 
   const handleDelete = async (plot: Plot): Promise<void> => {
+    if (plot.readonly === true) {
+      message.error('只读保留地块不允许删除（历史宗地回填不上，待权属复核）。');
+      return;
+    }
     try {
       await deletePlot(plot.id);
       message.success(`已删除地块「${plot.name}」及其全部子记录`);
@@ -134,6 +147,11 @@ export default function PlotList() {
       message.error(error instanceof Error ? error.message : '删除失败');
     }
   };
+
+  const heldCount = useMemo(
+    () => plots.filter((plot) => statOf(plot.id).heldByParcel || statOf(plot.id).readonly).length,
+    [plots, statOf],
+  );
 
   const columns: ColumnsType<Plot> = [
     {
@@ -186,6 +204,47 @@ export default function PlotList() {
       render: (value: string) => <Tag color={value === '已验收' ? 'green' : 'blue'}>{value}</Tag>,
     },
     {
+      title: '权属对接',
+      key: 'parcel',
+      width: 120,
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        if (stat.readonly) {
+          return (
+            <Tooltip title={replantBlockText('readonly')}>
+              <Tag icon={<LockOutlined />} color="default">
+                只读保留
+              </Tag>
+            </Tooltip>
+          );
+        }
+        if (stat.isSplitParent) {
+          return (
+            <Tooltip title={replantBlockText('split-parent')}>
+              <Tag color="purple">分宗母块</Tag>
+            </Tooltip>
+          );
+        }
+        if (stat.heldByParcel) {
+          return (
+            <Tooltip title={replantBlockText('parcel-held')}>
+              <Tag icon={<WarningOutlined />} color="error">
+                宗地挂起
+              </Tag>
+            </Tooltip>
+          );
+        }
+        if (stat.parcelCount === 0) {
+          return (
+            <Tooltip title={replantBlockText('no-parcel')}>
+              <Tag color="default">未挂宗地</Tag>
+            </Tooltip>
+          );
+        }
+        return <Tag color="green">已对接 {stat.parcelCount} 宗</Tag>;
+      },
+    },
+    {
       title: '苗木批次',
       key: 'seedlingCount',
       width: 96,
@@ -203,9 +262,23 @@ export default function PlotList() {
     {
       title: '验收测次',
       key: 'surveyCount',
-      width: 96,
+      width: 110,
       align: 'right',
-      render: (_value, record) => `${statOf(record.id).surveyCount} 次`,
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{stat.surveyCount} 次</span>
+            {stat.inheritedCount > 0 ? (
+              <Tooltip title="分宗子块从母块只读继承的历史测次，不进本地块成活率分母">
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  另继承 {stat.inheritedCount} 次
+                </Typography.Text>
+              </Tooltip>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '最新成活率',
@@ -262,7 +335,7 @@ export default function PlotList() {
           >
             栽植记录
           </Button>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+          <Button size="small" type="link" icon={<EditOutlined />} disabled={record.readonly === true} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
@@ -271,9 +344,10 @@ export default function PlotList() {
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
+            disabled={record.readonly === true}
             onConfirm={() => void handleDelete(record)}
           >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={record.readonly === true}>
               删除
             </Button>
           </Popconfirm>
@@ -318,6 +392,15 @@ export default function PlotList() {
         }
         styles={{ body: { paddingTop: 12 } }}
       >
+        {heldCount > 0 ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={`有 ${heldCount} 个地块的权属宗地挂起复核（或历史宗地回填不上只读保留）`}
+            description="挂起期间这些地块不出补植计划；历史栽植与验收数据仍可查看，地块不可编辑删除。"
+          />
+        ) : null}
         <FilterBar
           keyword={filters.keyword}
           onKeywordChange={(value: string) => setFilters({ keyword: value })}

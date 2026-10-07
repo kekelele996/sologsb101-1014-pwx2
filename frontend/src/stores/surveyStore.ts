@@ -5,12 +5,13 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey, ROW_REVISION } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
 import type { SurveyDraft } from '../types/survey';
 import { usePlotStore } from './plotStore';
+import { replantBlockReason, replantBlockText } from '../utils/parcel';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
 export interface SurveyFilters {
@@ -84,6 +85,14 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async createSurvey(draft) {
+    const plot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (plot !== undefined) {
+      const reason = replantBlockReason(plot, usePlotStore.getState().parcels, usePlotStore.getState().parcelLinks);
+      // 只读地块 / 分宗母块不允许再录测次；挂起地块的新测次同样冻结（挂起期间不产生新结论）
+      if (reason === 'readonly' || reason === 'split-parent' || reason === 'parcel-held') {
+        throw new Error(replantBlockText(reason));
+      }
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     const stamp = nowIso();
@@ -99,7 +108,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       gradeManual: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
@@ -109,6 +118,13 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async updateSurvey(surveyId, draft) {
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
+    const plot = usePlotStore.getState().plots.find((row) => row.id === draft.plotId);
+    if (plot !== undefined) {
+      const reason = replantBlockReason(plot, usePlotStore.getState().parcels, usePlotStore.getState().parcelLinks);
+      if (reason === 'readonly' || reason === 'parcel-held') {
+        throw new Error(replantBlockText(reason));
+      }
+    }
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     await putSurvey({
@@ -138,9 +154,15 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async generateReplant(plotId) {
-    const summary = get().summaryOf(plotId);
     const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
+    const { parcels, parcelLinks } = usePlotStore.getState();
+    const reason = replantBlockReason(plot, parcels, parcelLinks);
+    if (reason !== null) {
+      const held = parcels.find((item) => item.status === '挂起复核' && parcelLinks.some((link) => link.parcelId === item.id && link.plotId === plotId));
+      return replantBlockText(reason, held);
+    }
+    const summary = get().summaryOf(plotId);
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
@@ -154,7 +176,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

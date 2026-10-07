@@ -9,6 +9,8 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Parcel } from '../types/parcel';
+import type { ParcelLink } from '../types/parcelLink';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -19,6 +21,7 @@ import {
   removePlot,
 } from '../utils/db';
 import { buildSurvivalSummary, type SurvivalSummary } from '../hooks/useSurvivalRate';
+import { inheritedSurveys, isSplitParentPlot, replantBlockReason, type ReplantBlockReason } from '../utils/parcel';
 import { nowIso, uuid } from '../utils/id';
 
 /** 地块筛选条件（关键字 + 潮位带 + 底质），由 <FilterBar> 同步到 URL query */
@@ -37,8 +40,10 @@ export interface PlotStat {
   seedlingQuantity: number;
   /** 栽植总株数（株） */
   plantTotal: number;
-  /** 验收测次数 */
+  /** 验收测次数（不含分宗继承的只读历史测次） */
   surveyCount: number;
+  /** 分宗子块从母块继承的历史测次数（只读） */
+  inheritedCount: number;
   /** 最新成活率（%） */
   latestRate: number;
   /** 最新等级 */
@@ -47,6 +52,16 @@ export interface PlotStat {
   trend: number;
   /** 建议补植株数 */
   suggestReplant: number;
+  /** 是否分宗母块（历史测次留档） */
+  isSplitParent: boolean;
+  /** 是否只读保留（历史宗地回填不上） */
+  readonly: boolean;
+  /** 关联宗地数 */
+  parcelCount: number;
+  /** 关联宗地是否有挂起复核 */
+  heldByParcel: boolean;
+  /** 补植冻结原因（null = 可出补植计划） */
+  replantBlock: ReplantBlockReason;
 }
 
 const EMPTY_FILTERS: PlotFilters = { keyword: '', tideZone: 'all', substrate: 'all' };
@@ -74,6 +89,8 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  parcels: Parcel[];
+  parcelLinks: ParcelLink[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -101,10 +118,16 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   seedlingQuantity: 0,
   plantTotal: 0,
   surveyCount: 0,
+  inheritedCount: 0,
   latestRate: 0,
   level: 'poor',
   trend: 0,
   suggestReplant: 0,
+  isSplitParent: false,
+  readonly: false,
+  parcelCount: 0,
+  heldByParcel: false,
+  replantBlock: 'no-parcel',
 };
 
 let subscribed = false;
@@ -114,6 +137,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  parcels: [],
+  parcelLinks: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,31 +155,52 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, parcels, parcelLinks] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.parcels.toArray(),
+            db.parcelLinks.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, parcels, parcelLinks };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, parcels, parcelLinks }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
               const summary = buildSurvivalSummary(plot.id, surveys, plantings);
               summaries[plot.id] = summary;
+              const plotLinks = parcelLinks.filter((link) => link.plotId === plot.id);
+              const linkedParcelIds = Array.from(new Set(plotLinks.map((link) => link.parcelId)));
+              const heldByParcel = parcels.some(
+                (parcel) => linkedParcelIds.includes(parcel.id) && parcel.status === '挂起复核',
+              );
+              const effectiveDate = parcels
+                .filter((parcel) => linkedParcelIds.includes(parcel.id))
+                .map((parcel) => parcel.effectiveDate)
+                .sort()
+                .find((value) => value !== '') ?? '';
+              const inheritedCount = isSplitParentPlot(plot.id, parcelLinks)
+                ? 0
+                : inheritedSurveys(plot.id, parcelLinks, surveys, effectiveDate).length;
               stats[plot.id] = {
                 plotId: plot.id,
                 seedlingCount: plotSeedlings.length,
                 seedlingQuantity: plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
                 plantTotal: summary.totalCount,
                 surveyCount: summary.points.length,
+                inheritedCount,
                 latestRate: summary.latestRate,
                 level: summary.level,
                 trend: summary.trend,
                 suggestReplant: summary.suggestReplant,
+                isSplitParent: isSplitParentPlot(plot.id, parcelLinks),
+                readonly: plot.readonly === true,
+                parcelCount: linkedParcelIds.length,
+                heldByParcel,
+                replantBlock: replantBlockReason(plot, parcels, parcelLinks),
               };
             });
             const sorted = [...plots].sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
@@ -165,6 +211,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              parcels,
+              parcelLinks,
               stats,
               summaries,
               loading: false,

@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -40,6 +41,7 @@ import { useSurveyStore } from '../stores/surveyStore';
 import { db } from '../utils/db';
 import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, type RateLevel, type Survey } from '../types/survey';
 import { SURVIVAL_WARN_RATE, percentText } from '../utils/rate';
+import { inheritedSurveys, replantBlockReason, replantBlockText } from '../utils/parcel';
 
 interface SurveyFormValues {
   plotId: string;
@@ -55,6 +57,8 @@ export default function SurveyBoard() {
   const ready = usePlotStore((state) => state.ready);
   const statOf = usePlotStore((state) => state.statOf);
   const summaryOf = usePlotStore((state) => state.summaryOf);
+  const parcels = usePlotStore((state) => state.parcels);
+  const parcelLinks = usePlotStore((state) => state.parcelLinks);
   const filters = useSurveyStore((state) => state.filters);
   const setFilters = useSurveyStore((state) => state.setFilters);
   const resetFilters = useSurveyStore((state) => state.resetFilters);
@@ -99,6 +103,23 @@ export default function SurveyBoard() {
   }, [rows, filters, plots, summaryOf, surveyRevision]);
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+
+  /** 地块是否冻结录入（只读 / 挂起 / 分宗母块） */
+  const plotSurveyBlocked = (plotId: string): boolean => {
+    const plot = plots.find((item) => item.id === plotId);
+    if (plot === undefined) return true;
+    const reason = replantBlockReason(plot, parcels, parcelLinks);
+    return reason === 'readonly' || reason === 'split-parent' || reason === 'parcel-held';
+  };
+
+  /** 分宗子块从母块继承的历史测次（只读展示） */
+  const inheritedOf = (plotId: string) => {
+    const childParcel = parcels.find((parcel) =>
+      parcelLinks.some((link) => link.parcelId === parcel.id && link.plotId === plotId && link.linkType === 'split-child'),
+    );
+    if (childParcel === undefined) return [];
+    return inheritedSurveys(plotId, parcelLinks, rows, childParcel.effectiveDate);
+  };
 
   const stats = useMemo(() => {
     const rated = plots.filter((plot) => statOf(plot.id).surveyCount > 0);
@@ -170,7 +191,6 @@ export default function SurveyBoard() {
       setSubmitting(false);
     }
   };
-
   const handleBulkGrade = async (): Promise<void> => {
     const count = await bulkApplyGrade(gradeDraft);
     if (count === 0) {
@@ -194,15 +214,36 @@ export default function SurveyBoard() {
     {
       title: '地块',
       key: 'plot',
-      width: 200,
-      render: (_value, record) => (
-        <Space direction="vertical" size={0}>
-          <span>{plotName(record.plotId)}</span>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            栽植总株数 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
-          </Typography.Text>
-        </Space>
-      ),
+      width: 220,
+      render: (_value, record) => {
+        const plot = plots.find((item) => item.id === record.plotId);
+        const reason = plot === undefined ? null : replantBlockReason(plot, parcels, parcelLinks);
+        const heldParcel = reason === 'parcel-held'
+          ? parcels.find((parcel) =>
+              parcel.status === '挂起复核' &&
+              parcelLinks.some((link) => link.parcelId === parcel.id && link.plotId === record.plotId),
+            )
+          : undefined;
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{plotName(record.plotId)}</span>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              栽植总株数 {statOf(record.plotId).plantTotal.toLocaleString('zh-CN')} 株
+            </Typography.Text>
+            {reason === 'readonly' ? (
+              <Tag color="default" style={{ marginTop: 2 }}>只读保留</Tag>
+            ) : null}
+            {reason === 'split-parent' ? (
+              <Tag color="purple" style={{ marginTop: 2 }}>分宗母块·历史留档</Tag>
+            ) : null}
+            {reason === 'parcel-held' ? (
+              <Tooltip title={replantBlockText('parcel-held', heldParcel)}>
+                <Tag color="error" style={{ marginTop: 2 }}>宗地挂起</Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '测次',
@@ -275,28 +316,34 @@ export default function SurveyBoard() {
       title: '操作',
       key: 'action',
       width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该测次记录？"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={async () => {
-              await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
-            }}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
-      ),
+      render: (_value, record) => {
+        const blocked = plotSurveyBlocked(record.plotId);
+        return (
+          <Space size={4}>
+            <Tooltip title={blocked ? '该地块处于挂起 / 只读 / 分宗母块留档状态，测次不可改' : undefined}>
+              <Button size="small" type="link" icon={<EditOutlined />} disabled={blocked} onClick={() => openEdit(record)}>
+                编辑
+              </Button>
+            </Tooltip>
+            <Popconfirm
+              title="确认删除该测次记录？"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              disabled={blocked}
+              onConfirm={async () => {
+                await deleteSurvey(record.id);
+                await remove(record.id);
+                message.success('验收记录已删除');
+              }}
+            >
+              <Button size="small" type="link" danger icon={<DeleteOutlined />} disabled={blocked}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -304,6 +351,9 @@ export default function SurveyBoard() {
     const stat = statOf(plot.id);
     return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
   });
+
+  const focusPlotId = filters.plotId !== 'all' ? filters.plotId : plots.length > 0 ? plots[0].id : '';
+  const focusInherited = focusPlotId === '' ? [] : inheritedOf(focusPlotId);
 
   return (
     <div>
@@ -346,6 +396,27 @@ export default function SurveyBoard() {
         />
       ) : null}
 
+      {focusInherited.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`当前地块是分宗子块，只读继承母块「${plotName(focusInherited[0].parentPlotId)}」的 ${focusInherited.length} 个历史测次`}
+          description={
+            <Space size={8} wrap>
+              {focusInherited.map(({ survey }) => (
+                <Tag key={survey.id} color="purple">
+                  第 {survey.round} 次 · {survey.date} · {survey.aliveCount.toLocaleString('zh-CN')} 株
+                </Tag>
+              ))}
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                历史测次不拆株数、不进子块成活率分母；分宗后的新测次记在本侧班组地块。
+              </Typography.Text>
+            </Space>
+          }
+        />
+      ) : null}
+
       <Card
         title="成活率与株高验收台"
         extra={
@@ -363,12 +434,20 @@ export default function SurveyBoard() {
           <Space size={6}>
             <span style={{ color: '#5b6b66', fontSize: 13 }}>地块</span>
             <Select
-              style={{ minWidth: 200 }}
+              style={{ minWidth: 220 }}
               value={filters.plotId}
               onChange={(value: string) => setFilters({ plotId: value })}
               options={[
                 { value: 'all', label: '全部地块' },
-                ...plots.map((plot) => ({ value: plot.id, label: plot.name })),
+                ...plots.map((plot) => {
+                  const reason = replantBlockReason(plot, parcels, parcelLinks);
+                  const suffix =
+                    reason === 'split-parent' ? '（分宗母块）'
+                    : reason === 'parcel-held' ? '（宗地挂起）'
+                    : reason === 'readonly' ? '（只读）'
+                    : '';
+                  return { value: plot.id, label: `${plot.name}${suffix}` };
+                }),
               ]}
             />
           </Space>
@@ -463,7 +542,19 @@ export default function SurveyBoard() {
         <Form form={form} layout="vertical">
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item name="plotId" label="地块" style={{ flex: 2 }} rules={[{ required: true, message: '请选择地块' }]}>
-              <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
+              <Select
+                options={plots.map((plot) => {
+                  const reason = replantBlockReason(plot, parcels, parcelLinks);
+                  const disabled = reason === 'readonly' || reason === 'split-parent' || reason === 'parcel-held';
+                  return {
+                    value: plot.id,
+                    label: disabled
+                      ? `${plot.name}（${reason === 'split-parent' ? '分宗母块留档' : reason === 'parcel-held' ? '宗地挂起' : '只读保留'}）`
+                      : plot.name,
+                    disabled,
+                  };
+                })}
+              />
             </Form.Item>
             <Form.Item name="round" label="测次" style={{ flex: 1 }} rules={[{ required: true, message: '请填写测次' }]}>
               <InputNumber min={1} max={99} style={{ width: '100%' }} />
@@ -492,6 +583,8 @@ export default function SurveyBoard() {
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            并宗地块的分母按各老地块栽植总株数相加（在权属宗地台账查看跨宗口径）；
+            分宗母块、宗地挂起复核与只读保留的地块不能录入 / 修改测次。
           </Typography.Text>
         </Form>
       </Modal>

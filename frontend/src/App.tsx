@@ -7,6 +7,7 @@ import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import {
   AppstoreOutlined,
+  AuditOutlined,
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
@@ -16,6 +17,7 @@ import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
 import { useSurveyStore } from './stores/surveyStore';
+import { useParcelStore } from './stores/parcelStore';
 import { percentText } from './utils/rate';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -23,6 +25,7 @@ const { Header, Sider, Content, Footer } = Layout;
 /** 按当前路径推导高亮的导航项 */
 function selectedKey(pathname: string): string {
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
+  if (pathname.startsWith('/parcels')) return ROUTES.parcels;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
   return ROUTES.plots;
@@ -39,12 +42,14 @@ export default function App() {
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
+  const loadParcels = useParcelStore((state) => state.loadAll);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+    void loadParcels();
+  }, [loadAll, initSurvey, initReplant, loadParcels]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -68,6 +73,7 @@ export default function App() {
           onClick={({ key }) => navigate(key)}
           items={[
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
+            { key: ROUTES.parcels, icon: <AuditOutlined />, label: '权属宗地台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
           ]}
